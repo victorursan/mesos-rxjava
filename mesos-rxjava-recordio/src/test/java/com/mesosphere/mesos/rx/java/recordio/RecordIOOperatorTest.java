@@ -163,7 +163,7 @@ public class RecordIOOperatorTest {
         assertThat(call).isInstanceOf(RecordIOOperator.RecordIOSubscriber.class);
 
         final RecordIOOperator.RecordIOSubscriber subscriber = (RecordIOOperator.RecordIOSubscriber) call;
-        chunks.stream().forEach(subscriber::onNext);
+        chunks.forEach(subscriber::onNext);
         child.assertNoErrors();
         child.assertNotCompleted();
         child.assertNoTerminalEvent();

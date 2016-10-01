@@ -24,9 +24,13 @@ import org.slf4j.LoggerFactory;
 import rx.Observable.Operator;
 import rx.Subscriber;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.IntStream;
+
+import static java.lang.Math.min;
 
 /**
  * An {@link Operator} that can be applied to a stream of {@link ByteBuf} and produce
@@ -49,10 +53,10 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
      * <a href="https://github.com/apache/mesos/blob/master/docs/scheduler-http-api.md#recordio-response-format">
      * RecordIO format</a>. If a single {@link ByteBuf} does not represent a full message, the data will be
      * buffered until a full message can be obtained.
-     *
+     * <p>
      * <i>
-     *     Due to the way arrays in Java work, there is an effective limitation to message size of
-     *     2gb. This is because arrays are indexed with signed 32-bit integers.
+     * Due to the way arrays in Java work, there is an effective limitation to message size of
+     * 2gb. This is because arrays are indexed with signed 32-bit integers.
      * </i>
      */
     static final class RecordIOSubscriber extends Subscriber<ByteBuf> {
@@ -75,12 +79,6 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
         final List<Byte> messageSizeBytesBuffer = new ArrayList<>();
 
         /**
-         * Flag used to signify that we've reached the point in the stream that we should have
-         * the full set of bytes needed in order to decode the message length.
-         */
-        boolean allSizeBytesBuffered = false;
-
-        /**
          * The allocated {@code byte[]} for the current message being read from the stream.
          * Once all the bytes of the message have been read this reference will be
          * nulled out until the next message size has been resolved.
@@ -100,6 +98,13 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
             this.child = child;
         }
 
+        private static byte[] getByteArray(@NotNull final List<Byte> list) {
+            final byte[] bytes = new byte[list.size()];
+            IntStream.range(0, list.size())
+                    .forEach(i -> bytes[i] = list.get(i));
+            return bytes;
+        }
+
         @Override
         public void onStart() {
             request(Long.MAX_VALUE);
@@ -113,63 +118,62 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
          * will be called and the method will terminate without attempting to do any
          * sort of recovery.
          *
-         * @param t    The {@link ByteBuf} to process
+         * @param byteBuf The {@link ByteBuf} to process
          */
         @Override
-        public void onNext(final ByteBuf t) {
-            try {
-                final ByteBufInputStream in = new ByteBufInputStream(t);
-                while (t.readableBytes() > 0) {
+        public void onNext(final ByteBuf byteBuf) {
+            try (final ByteBufInputStream inByteStream = new ByteBufInputStream(byteBuf)) {
+                while (byteBuf.readableBytes() > 0) {
                     // New message
                     if (remainingBytesForMessage == 0) {
 
                         // Figure out the size of the message
                         byte b;
-                        while ((b = (byte) in.read()) != -1) {
-                            if (b == (byte) '\n') {
-                                allSizeBytesBuffered = true;
-                                break;
-                            } else {
-                                messageSizeBytesBuffer.add(b);
-                            }
+                        while ((b = (byte) inByteStream.read()) != -1 && b != (byte) '\n') {
+                            messageSizeBytesBuffer.add(b);
                         }
 
                         // Allocate the byte[] for the message and get ready to read it
-                        if (allSizeBytesBuffered) {
+                        if (b == (byte) '\n') {
                             final byte[] bytes = getByteArray(messageSizeBytesBuffer);
-                            allSizeBytesBuffered = false;
                             final String sizeString = new String(bytes, StandardCharsets.UTF_8);
                             messageSizeBytesBuffer.clear();
-                            final long l = Long.valueOf(sizeString, 10);
-                            if (l > Integer.MAX_VALUE) {
-                                LOGGER.warn("specified message size ({}) is larger than Integer.MAX_VALUE. Value will be truncated to int");
-                                remainingBytesForMessage = Integer.MAX_VALUE;
-                                // TODO: Possibly make this more robust to account for things larger than 2g
-                            } else {
-                                remainingBytesForMessage = (int) l;
-                            }
-
+                            remainingBytesForMessage = getMaxRemaining(sizeString);
                             messageBytes = new byte[remainingBytesForMessage];
                         }
                     }
 
                     // read bytes until we either reach the end of the ByteBuf or the message is fully read.
-                    final int readableBytes = t.readableBytes();
-                    if (readableBytes > 0) {
-                        final int writeStart = messageBytes.length - remainingBytesForMessage;
-                        final int numBytesToCopy = Math.min(readableBytes, remainingBytesForMessage);
-                        final int read = in.read(messageBytes, writeStart, numBytesToCopy);
-                        remainingBytesForMessage -= read;
-                    }
-
-                    // Once we've got a full message send it on downstream.
-                    if (remainingBytesForMessage == 0 && messageBytes != null) {
-                        child.onNext(messageBytes);
-                        messageBytes = null;
-                    }
+                    readFullMessage(byteBuf, inByteStream);
                 }
             } catch (Exception e) {
                 onError(e);
+            }
+        }
+
+        private int getMaxRemaining(@NotNull final String stringValue) {
+            final long l = Long.valueOf(stringValue);
+            if (l > Integer.MAX_VALUE) {
+                LOGGER.warn("specified message size ({}) is larger than Integer.MAX_VALUE. Value will be truncated to int");
+                return Integer.MAX_VALUE;
+                // TODO: Possibly make this more robust to account for things larger than 2g
+            }
+            return (int) l;
+        }
+
+        private void readFullMessage(@NotNull final ByteBuf byteBuf, @NotNull final ByteBufInputStream inByteStream) throws IOException {
+            final int readableBytes = byteBuf.readableBytes();
+            if (readableBytes > 0) {
+                final int writeStart = messageBytes.length - remainingBytesForMessage;
+                final int numBytesToCopy = min(readableBytes, remainingBytesForMessage);
+                final int read = inByteStream.read(messageBytes, writeStart, numBytesToCopy);
+                remainingBytesForMessage -= read;
+            }
+
+            // Once we've got a full message send it on downstream.
+            if (remainingBytesForMessage == 0 && messageBytes != null) {
+                child.onNext(messageBytes);
+                messageBytes = null;
             }
         }
 
@@ -181,14 +185,6 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
         @Override
         public void onCompleted() {
             child.onCompleted();
-        }
-
-        private static byte[] getByteArray(@NotNull final List<Byte> list) {
-            final byte[] bytes = new byte[list.size()];
-            for (int i = 0; i < list.size(); i++) {
-                bytes[i] = list.get(i);
-            }
-            return bytes;
         }
 
     }
