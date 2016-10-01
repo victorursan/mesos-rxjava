@@ -30,6 +30,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.IntStream;
 
+import static java.lang.Math.min;
+
 /**
  * An {@link Operator} that can be applied to a stream of {@link ByteBuf} and produce
  * a stream of {@code byte[]} messages following the RecordIO format.
@@ -116,18 +118,18 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
          * will be called and the method will terminate without attempting to do any
          * sort of recovery.
          *
-         * @param t The {@link ByteBuf} to process
+         * @param byteBuf The {@link ByteBuf} to process
          */
         @Override
-        public void onNext(final ByteBuf t) {
-            try (final ByteBufInputStream in = new ByteBufInputStream(t)) {
-                while (t.readableBytes() > 0) {
+        public void onNext(final ByteBuf byteBuf) {
+            try (final ByteBufInputStream inByteStream = new ByteBufInputStream(byteBuf)) {
+                while (byteBuf.readableBytes() > 0) {
                     // New message
                     if (remainingBytesForMessage == 0) {
 
                         // Figure out the size of the message
                         byte b;
-                        while ((b = (byte) in.read()) != -1 && b != (byte) '\n') {
+                        while ((b = (byte) inByteStream.read()) != -1 && b != (byte) '\n') {
                             messageSizeBytesBuffer.add(b);
                         }
 
@@ -142,7 +144,7 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
                     }
 
                     // read bytes until we either reach the end of the ByteBuf or the message is fully read.
-                    readFullMessage(t, in);
+                    readFullMessage(byteBuf, inByteStream);
                 }
             } catch (Exception e) {
                 onError(e);
@@ -150,7 +152,7 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
         }
 
         private int getMaxRemaining(@NotNull final String stringValue) {
-            final long l = Long.valueOf(stringValue, 10);
+            final long l = Long.valueOf(stringValue);
             if (l > Integer.MAX_VALUE) {
                 LOGGER.warn("specified message size ({}) is larger than Integer.MAX_VALUE. Value will be truncated to int");
                 return Integer.MAX_VALUE;
@@ -159,12 +161,12 @@ public final class RecordIOOperator implements Operator<byte[], ByteBuf> {
             return (int) l;
         }
 
-        private void readFullMessage(@NotNull final ByteBuf byteBuf, @NotNull final ByteBufInputStream in) throws IOException {
+        private void readFullMessage(@NotNull final ByteBuf byteBuf, @NotNull final ByteBufInputStream inByteStream) throws IOException {
             final int readableBytes = byteBuf.readableBytes();
             if (readableBytes > 0) {
                 final int writeStart = messageBytes.length - remainingBytesForMessage;
-                final int numBytesToCopy = Math.min(readableBytes, remainingBytesForMessage);
-                final int read = in.read(messageBytes, writeStart, numBytesToCopy);
+                final int numBytesToCopy = min(readableBytes, remainingBytesForMessage);
+                final int read = inByteStream.read(messageBytes, writeStart, numBytesToCopy);
                 remainingBytesForMessage -= read;
             }
 
